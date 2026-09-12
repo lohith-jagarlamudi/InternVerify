@@ -2,6 +2,16 @@ import { StrictMode, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
+const fieldLabels = {
+  student_name: 'Student name',
+  company_name: 'Company name',
+  internship_role: 'Internship role',
+  start_date: 'Start date',
+  end_date: 'End date',
+  certificate_number: 'Certificate number',
+  verification_url: 'Verification URL',
+};
+
 function App() {
   const [file, setFile] = useState(null);
   const [message, setMessage] = useState('');
@@ -13,7 +23,7 @@ function App() {
 
     const body = new FormData();
     body.append('file', file);
-    setMessage('Uploading and extracting text…');
+    setMessage('Uploading and extracting certificate fields…');
     setDetails(null);
 
     try {
@@ -52,6 +62,16 @@ function App() {
             <p><strong>File size:</strong> {details.size_bytes} bytes</p>
             <p><strong>Extraction status:</strong> {details.next_step}</p>
             <p><strong>Note:</strong> {details.extraction_note}</p>
+            {details.extracted_fields && (
+              <>
+                <h3>Extracted certificate fields</h3>
+                <div className="fields">
+                  {Object.entries(fieldLabels).map(([key, label]) => (
+                    <p key={key}><strong>{label}:</strong> {details.extracted_fields[key] || 'Not detected'}</p>
+                  ))}
+                </div>
+              </>
+            )}
             {details.text_preview && (
               <>
                 <h3>Extracted text preview</h3>
