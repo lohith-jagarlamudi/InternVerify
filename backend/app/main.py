@@ -6,7 +6,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 
-app = FastAPI(title="InternVerify API", version="0.4.0")
+app = FastAPI(title="InternVerify API", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,39 +26,53 @@ def extract_pdf_text(path: Path) -> str:
     return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
 
 
+def clean_value(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip(" :.-\t\n")
+    return value.rstrip(".,;")
+
+
 def first_match(patterns: list[str], text: str) -> str | None:
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
         if match:
-            return match.group(1).strip(" :.-\t")
+            value = clean_value(match.group(1))
+            if value:
+                return value
     return None
 
 
 def extract_certificate_fields(text: str) -> dict[str, str | None]:
+    normalized = re.sub(r"[ \t]+", " ", text)
     return {
         "student_name": first_match([
-            r"(?:student|intern|trainee)\s*name\s*[:\-]\s*(.+)",
-            r"(?:certify that|certifies that)\s+([A-Z][A-Za-z .'-]{2,})\s+(?:has|had|successfully)",
-        ], text),
+            r"(?:student|intern|trainee)\s*(?:name)?\s*[:\-]\s*([^\n]+)",
+            r"(?:certify|certifies)\s+that\s+([A-Z][A-Za-z .'-]{2,80}?)(?:\s+(?:has|had|successfully|completed|participated)\b)",
+            r"(?:awarded|presented|issued)\s+to\s*[:\-]?\s*([^\n]+)",
+        ], normalized),
         "company_name": first_match([
-            r"(?:company|organization|organisation|employer)\s*name\s*[:\-]\s*(.+)",
-            r"(?:at|with)\s+([A-Z][A-Za-z0-9 &'.,-]{2,})",
-        ], text),
+            r"(?:company|organization|organisation|employer|host company)\s*(?:name)?\s*[:\-]\s*([^\n]+)",
+            r"(?:internship|training|program)\s+(?:at|with)\s+([A-Z][A-Za-z0-9 &'.,-]{2,100})",
+            r"(?:issued|provided|offered)\s+by\s*[:\-]?\s*([^\n]+)",
+        ], normalized),
         "internship_role": first_match([
-            r"(?:role|designation|position|internship domain)\s*[:\-]\s*(.+)",
-        ], text),
+            r"(?:role|designation|position|domain|area|department)\s*[:\-]\s*([^\n]+)",
+            r"(?:worked|served|interned)\s+as\s+([^\n]+)",
+        ], normalized),
         "start_date": first_match([
-            r"(?:start|from|commencement)\s*date\s*[:\-]\s*(.+)",
-        ], text),
+            r"(?:start|from|commencement|beginning)\s*date?\s*[:\-]\s*([^\n]+)",
+            r"(?:from)\s+([0-3]?\d[/-][01]?\d[/-](?:20)?\d{2}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        ], normalized),
         "end_date": first_match([
-            r"(?:end|to|completion)\s*date\s*[:\-]\s*(.+)",
-        ], text),
+            r"(?:end|to|completion|conclusion)\s*date?\s*[:\-]\s*([^\n]+)",
+            r"(?:to|until)\s+([0-3]?\d[/-][01]?\d[/-](?:20)?\d{2}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        ], normalized),
         "certificate_number": first_match([
             r"(?:certificate|certification)\s*(?:no|number|id)\s*[:#\-]\s*([A-Za-z0-9./_-]+)",
-        ], text),
+            r"(?:credential|verification)\s*(?:no|number|id)\s*[:#\-]\s*([A-Za-z0-9./_-]+)",
+        ], normalized),
         "verification_url": first_match([
-            r"(https?://[^\s)]+)",
-        ], text),
+            r"(https?://[^\s)<>]+)",
+        ], normalized),
     }
 
 
@@ -81,7 +95,7 @@ async def upload_certificate(file: UploadFile = File(...)) -> dict:
     extracted_text = ""
     extraction_status = "text_extraction_pending"
     extraction_note = "Text extraction is currently supported for text-based PDF files."
-    extracted_fields = {}
+    extracted_fields: dict[str, str | None] = {}
 
     if (file.content_type or "").lower() == "application/pdf":
         try:
@@ -95,15 +109,20 @@ async def upload_certificate(file: UploadFile = File(...)) -> dict:
     elif (file.content_type or "").startswith("image/"):
         extraction_note = "Image OCR will be added in a later milestone."
 
+    important_fields = ["student_name", "company_name", "start_date", "end_date"]
+    missing_fields = [name for name in important_fields if not extracted_fields.get(name)]
+    review_status = "needs_review" if missing_fields else "ready_for_verification"
+
     return {
         "certificate_id": certificate_id,
         "filename": original_name,
         "stored_filename": stored_name,
         "content_type": file.content_type or "application/octet-stream",
         "size_bytes": len(contents),
-        "status": "received",
+        "status": review_status,
         "next_step": extraction_status,
         "extraction_note": extraction_note,
         "text_preview": extracted_text[:2000],
         "extracted_fields": extracted_fields,
+        "missing_fields": missing_fields,
     }
