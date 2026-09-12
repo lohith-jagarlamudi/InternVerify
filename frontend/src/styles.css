@@ -1,0 +1,18 @@
+:root {
+  font-family: Inter, system-ui, sans-serif;
+  color: #172033;
+  background: #f4f7fb;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+.shell { max-width: 880px; margin: 0 auto; padding: 72px 24px; }
+.eyebrow { color: #5263d9; font-size: 0.8rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; }
+h1 { margin: 8px 0; font-size: clamp(2.5rem, 8vw, 4.5rem); letter-spacing: -0.06em; }
+.intro { max-width: 560px; color: #5e687c; font-size: 1.1rem; line-height: 1.6; }
+.panel { margin-top: 48px; padding: 32px; border: 1px solid #e0e6f0; border-radius: 20px; background: white; box-shadow: 0 18px 50px rgba(37, 53, 86, 0.08); }
+h2 { margin-top: 0; }
+form { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+button { border: 0; border-radius: 10px; padding: 12px 18px; color: white; background: #5263d9; font-weight: 700; cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: 0.45; }
+.message { color: #5263d9; font-weight: 600; }
