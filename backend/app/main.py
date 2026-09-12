@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 
-app = FastAPI(title="InternVerify API", version="0.7.0")
+app = FastAPI(title="InternVerify API", version="0.8.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -86,6 +86,19 @@ def locate_file(certificate_id: str) -> Path:
     return matches[0]
 
 
+def classify_verification(response: httpx.Response) -> tuple[str, str]:
+    if not response.is_success:
+        return "verification_failed", f"Verification page returned HTTP {response.status_code}."
+    body = response.text.lower()
+    positive_markers = ("certificate is valid", "certificate verified", "verification successful", "credential verified", "valid certificate")
+    negative_markers = ("certificate not found", "invalid certificate", "verification failed", "invalid credential", "does not exist")
+    if any(marker in body for marker in negative_markers):
+        return "verification_failed", "The verification page indicates that the certificate is invalid or was not found."
+    if any(marker in body for marker in positive_markers):
+        return "verified", "The verification page contains a positive certificate-verification result."
+    return "verification_unavailable", "The verification page was reachable, but no clear verification result was detected."
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "internverify-api"}
@@ -133,12 +146,18 @@ async def verify_certificate(certificate_id: str):
     if not sources:
         return {"status": "no_verification_source", "message": "No QR code or verification link was found."}
     results = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15, headers={"User-Agent": "InternVerify/0.8"}) as client:
         for source in sources:
             try:
                 response = await client.get(source["url"])
-                results.append({**source, "http_status": response.status_code, "reachable": response.is_success})
+                status, message = classify_verification(response)
+                results.append({**source, "http_status": response.status_code, "reachable": response.is_success, "status": status, "message": message})
             except httpx.HTTPError as exc:
-                results.append({**source, "reachable": False, "error": type(exc).__name__})
-    status = "verified" if any(item.get("reachable") for item in results) else "verification_unavailable"
-    return {"status": status, "verification_results": results}
+                results.append({**source, "reachable": False, "status": "verification_unavailable", "message": f"Could not access verification page: {type(exc).__name__}."})
+    if any(item["status"] == "verified" for item in results):
+        overall_status = "verified"
+    elif any(item["status"] == "verification_failed" for item in results):
+        overall_status = "verification_failed"
+    else:
+        overall_status = "verification_unavailable"
+    return {"status": overall_status, "message": "Verification completed for detected sources.", "verification_results": results}
