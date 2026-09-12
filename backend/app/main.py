@@ -2,19 +2,15 @@ from pathlib import Path
 import re
 from uuid import uuid4
 
-from fastapi import FastAPI, File, UploadFile
+import cv2
+import fitz
+import httpx
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 
-app = FastAPI(title="InternVerify API", version="0.6.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="InternVerify API", version="0.7.0")
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -26,132 +22,123 @@ def extract_pdf_text(path: Path) -> str:
     return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
 
 
-def clean_value(value: str) -> str:
-    value = re.sub(r"\s+", " ", value).strip(" :.-\t\n")
-    return value.rstrip(".,;")
+def clean_url(value: str) -> str:
+    return value.rstrip(".,;)]}>")
+
+
+def extract_urls(text: str) -> list[str]:
+    return list(dict.fromkeys(clean_url(x) for x in re.findall(r"https?://[^\s<>\"']+", text)))
+
+
+def scan_image(image, detector, page_number: int | None = None) -> list[dict]:
+    found = []
+    try:
+        data, _, _ = detector.detectAndDecode(image)
+        if data and data.startswith(("http://", "https://")):
+            found.append({"source_type": "qr", "url": clean_url(data), "page": page_number})
+    except Exception:
+        pass
+    return found
+
+
+def detect_verification_sources(path: Path, content_type: str, text: str) -> list[dict]:
+    detector = cv2.QRCodeDetector()
+    sources = []
+    if content_type == "application/pdf":
+        document = fitz.open(str(path))
+        for index, page in enumerate(document):
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image = cv2.imdecode(__import__("numpy").frombuffer(pix.tobytes("png"), dtype="uint8"), cv2.IMREAD_COLOR)
+            sources.extend(scan_image(image, detector, index + 1))
+        document.close()
+    elif content_type.startswith("image/"):
+        image = cv2.imread(str(path))
+        if image is not None:
+            sources.extend(scan_image(image, detector))
+    for url in extract_urls(text):
+        if not any(item["url"] == url for item in sources):
+            sources.append({"source_type": "link", "url": url, "page": None})
+    return sources
 
 
 def first_match(patterns: list[str], text: str) -> str | None:
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
         if match:
-            value = clean_value(match.group(1))
+            value = re.sub(r"\s+", " ", match.group(1)).strip(" :.-\t\n").rstrip(".,;")
             if value:
                 return value
     return None
 
 
-def all_matches(patterns: list[str], text: str, limit: int = 8) -> list[str]:
-    values: list[str] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.MULTILINE):
-            value = clean_value(match.group(1))
-            if value and value not in values:
-                values.append(value)
-            if len(values) >= limit:
-                return values
-    return values
-
-
 def extract_certificate_fields(text: str) -> dict[str, str | None]:
-    normalized = re.sub(r"[ \t]+", " ", text)
     return {
-        "student_name": first_match([
-            r"(?:student|intern|trainee)\s*(?:name)?\s*[:\-]\s*([^\n]+)",
-            r"(?:certify|certifies)\s+that\s+([A-Z][A-Za-z .'-]{2,80}?)(?:\s+(?:has|had|successfully|completed|participated)\b)",
-            r"(?:awarded|presented|issued)\s+to\s*[:\-]?\s*([^\n]+)",
-        ], normalized),
-        "company_name": first_match([
-            r"(?:company|organization|organisation|employer|host company)\s*(?:name)?\s*[:\-]\s*([^\n]+)",
-            r"(?:internship|training|program)\s+(?:at|with)\s+([A-Z][A-Za-z0-9 &'.,-]{2,100})",
-            r"(?:issued|provided|offered)\s+by\s*[:\-]?\s*([^\n]+)",
-        ], normalized),
-        "internship_role": first_match([
-            r"(?:role|designation|position|domain|area|department)\s*[:\-]\s*([^\n]+)",
-            r"(?:worked|served|interned)\s+as\s+([^\n]+)",
-        ], normalized),
-        "start_date": first_match([
-            r"(?:start|from|commencement|beginning)\s*date?\s*[:\-]\s*([^\n]+)",
-            r"(?:from)\s+([0-3]?\d[/-][01]?\d[/-](?:20)?\d{2}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-        ], normalized),
-        "end_date": first_match([
-            r"(?:end|to|completion|conclusion)\s*date?\s*[:\-]\s*([^\n]+)",
-            r"(?:to|until)\s+([0-3]?\d[/-][01]?\d[/-](?:20)?\d{2}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-        ], normalized),
-        "certificate_number": first_match([
-            r"(?:certificate|certification)\s*(?:no|number|id)\s*[:#\-]\s*([A-Za-z0-9./_-]+)",
-            r"(?:credential|verification)\s*(?:no|number|id)\s*[:#\-]\s*([A-Za-z0-9./_-]+)",
-        ], normalized),
-        "verification_url": first_match([r"(https?://[^\s)<>]+)"], normalized),
+        "student_name": first_match([r"(?:student|intern|trainee)\s*(?:name)?\s*[:\-]\s*([^\n]+)", r"(?:awarded|presented|issued)\s+to\s*[:\-]?\s*([^\n]+)"], text),
+        "company_name": first_match([r"(?:company|organization|organisation|employer)\s*(?:name)?\s*[:\-]\s*([^\n]+)", r"(?:internship|training|program)\s+(?:at|with)\s+([A-Z][A-Za-z0-9 &'.,-]{2,100})"], text),
+        "certificate_number": first_match([r"(?:certificate|certification)\s*(?:no|number|id)\s*[:#\-]\s*([A-Za-z0-9./_-]+)"], text),
     }
 
 
-def extract_candidates(text: str) -> dict[str, list[str]]:
-    date_pattern = r"\b(?:[0-3]?\d[/-][01]?\d[/-](?:19|20)?\d{2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\b"
-    return {
-        "dates": all_matches([date_pattern], text),
-        "possible_names": all_matches([
-            r"(?:certify|certifies)\s+that\s+([A-Z][A-Za-z .'-]{2,80}?)(?:\s+(?:has|had|successfully|completed|participated)\b)",
-            r"(?:awarded|presented|issued)\s+to\s*[:\-]?\s*([^\n]+)",
-        ], text),
-        "possible_organizations": all_matches([
-            r"(?:at|with|by)\s+([A-Z][A-Za-z0-9 &'.,-]{2,100})",
-        ], text),
-    }
+def locate_file(certificate_id: str) -> Path:
+    matches = list(UPLOAD_DIR.glob(f"{certificate_id}_*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    return matches[0]
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health():
     return {"status": "ok", "service": "internverify-api"}
 
 
 @app.post("/api/certificates/upload")
-async def upload_certificate(file: UploadFile = File(...)) -> dict:
+async def upload_certificate(file: UploadFile = File(...)):
     original_name = file.filename or "unknown"
     certificate_id = str(uuid4())
-    safe_name = Path(original_name).name
-    stored_name = f"{certificate_id}_{safe_name}"
+    stored_name = f"{certificate_id}_{Path(original_name).name}"
     destination = UPLOAD_DIR / stored_name
-
     contents = await file.read()
     destination.write_bytes(contents)
-
-    extracted_text = ""
-    extraction_status = "text_extraction_pending"
-    extraction_note = "Text extraction is currently supported for text-based PDF files."
-    extracted_fields: dict[str, str | None] = {}
-    candidates: dict[str, list[str]] = {}
-
-    if (file.content_type or "").lower() == "application/pdf":
+    content_type = (file.content_type or "application/octet-stream").lower()
+    text = ""
+    extraction_note = ""
+    if content_type == "application/pdf":
         try:
-            extracted_text = extract_pdf_text(destination)
-            extraction_status = "text_extraction_completed"
-            extraction_note = "PDF text extracted successfully." if extracted_text else "PDF contains no selectable text; OCR may be needed."
-            if extracted_text:
-                extracted_fields = extract_certificate_fields(extracted_text)
-                candidates = extract_candidates(extracted_text)
+            text = extract_pdf_text(destination)
+            extraction_note = "PDF text extracted successfully." if text else "No selectable PDF text found. QR scanning was still attempted."
         except Exception as exc:
-            extraction_status = "text_extraction_failed"
-            extraction_note = f"Could not extract PDF text: {type(exc).__name__}"
-    elif (file.content_type or "").startswith("image/"):
-        extraction_note = "Image OCR will be added in a later milestone."
-
-    important_fields = ["student_name", "company_name", "start_date", "end_date"]
-    missing_fields = [name for name in important_fields if not extracted_fields.get(name)]
-    review_status = "needs_review" if missing_fields else "ready_for_verification"
-
+            extraction_note = f"Text extraction failed: {type(exc).__name__}. QR scanning was still attempted."
+    sources = detect_verification_sources(destination, content_type, text)
     return {
         "certificate_id": certificate_id,
         "filename": original_name,
         "stored_filename": stored_name,
-        "content_type": file.content_type or "application/octet-stream",
+        "content_type": content_type,
         "size_bytes": len(contents),
-        "status": review_status,
-        "next_step": extraction_status,
+        "status": "verification_source_found" if sources else "no_verification_source",
+        "next_step": "verify_certificate" if sources else "manual_source_check",
         "extraction_note": extraction_note,
-        "text_preview": extracted_text[:2000],
-        "full_text": extracted_text,
-        "extracted_fields": extracted_fields,
-        "candidate_values": candidates,
-        "missing_fields": missing_fields,
+        "verification_sources": sources,
+        "text_preview": text[:2000],
+        "extracted_fields": extract_certificate_fields(text) if text else {},
     }
+
+
+@app.post("/api/certificates/{certificate_id}/verify")
+async def verify_certificate(certificate_id: str):
+    path = locate_file(certificate_id)
+    content_type = "application/pdf" if path.suffix.lower() == ".pdf" else "image/unknown"
+    text = extract_pdf_text(path) if content_type == "application/pdf" else ""
+    sources = detect_verification_sources(path, content_type, text)
+    if not sources:
+        return {"status": "no_verification_source", "message": "No QR code or verification link was found."}
+    results = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        for source in sources:
+            try:
+                response = await client.get(source["url"])
+                results.append({**source, "http_status": response.status_code, "reachable": response.is_success})
+            except httpx.HTTPError as exc:
+                results.append({**source, "reachable": False, "error": type(exc).__name__})
+    status = "verified" if any(item.get("reachable") for item in results) else "verification_unavailable"
+    return {"status": status, "verification_results": results}
