@@ -13,7 +13,7 @@ function App() {
 
     const body = new FormData();
     body.append('file', file);
-    setMessage('Uploading…');
+    setMessage('Uploading and extracting text…');
     setDetails(null);
 
     try {
@@ -46,11 +46,18 @@ function App() {
         {message && <p className="message" role="status">{message}</p>}
         {details && (
           <div className="result" aria-live="polite">
-            <h3>Upload details</h3>
+            <h3>Certificate processing</h3>
             <p><strong>Status:</strong> {details.status}</p>
             <p><strong>Certificate ID:</strong> {details.certificate_id}</p>
             <p><strong>File size:</strong> {details.size_bytes} bytes</p>
-            <p><strong>Next step:</strong> {details.next_step}</p>
+            <p><strong>Extraction status:</strong> {details.next_step}</p>
+            <p><strong>Note:</strong> {details.extraction_note}</p>
+            {details.text_preview && (
+              <>
+                <h3>Extracted text preview</h3>
+                <pre className="text-preview">{details.text_preview}</pre>
+              </>
+            )}
           </div>
         )}
       </section>
