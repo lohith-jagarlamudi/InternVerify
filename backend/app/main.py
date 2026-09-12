@@ -6,7 +6,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 
-app = FastAPI(title="InternVerify API", version="0.5.0")
+app = FastAPI(title="InternVerify API", version="0.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +41,18 @@ def first_match(patterns: list[str], text: str) -> str | None:
     return None
 
 
+def all_matches(patterns: list[str], text: str, limit: int = 8) -> list[str]:
+    values: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.MULTILINE):
+            value = clean_value(match.group(1))
+            if value and value not in values:
+                values.append(value)
+            if len(values) >= limit:
+                return values
+    return values
+
+
 def extract_certificate_fields(text: str) -> dict[str, str | None]:
     normalized = re.sub(r"[ \t]+", " ", text)
     return {
@@ -70,9 +82,21 @@ def extract_certificate_fields(text: str) -> dict[str, str | None]:
             r"(?:certificate|certification)\s*(?:no|number|id)\s*[:#\-]\s*([A-Za-z0-9./_-]+)",
             r"(?:credential|verification)\s*(?:no|number|id)\s*[:#\-]\s*([A-Za-z0-9./_-]+)",
         ], normalized),
-        "verification_url": first_match([
-            r"(https?://[^\s)<>]+)",
-        ], normalized),
+        "verification_url": first_match([r"(https?://[^\s)<>]+)"], normalized),
+    }
+
+
+def extract_candidates(text: str) -> dict[str, list[str]]:
+    date_pattern = r"\b(?:[0-3]?\d[/-][01]?\d[/-](?:19|20)?\d{2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\b"
+    return {
+        "dates": all_matches([date_pattern], text),
+        "possible_names": all_matches([
+            r"(?:certify|certifies)\s+that\s+([A-Z][A-Za-z .'-]{2,80}?)(?:\s+(?:has|had|successfully|completed|participated)\b)",
+            r"(?:awarded|presented|issued)\s+to\s*[:\-]?\s*([^\n]+)",
+        ], text),
+        "possible_organizations": all_matches([
+            r"(?:at|with|by)\s+([A-Z][A-Za-z0-9 &'.,-]{2,100})",
+        ], text),
     }
 
 
@@ -96,13 +120,16 @@ async def upload_certificate(file: UploadFile = File(...)) -> dict:
     extraction_status = "text_extraction_pending"
     extraction_note = "Text extraction is currently supported for text-based PDF files."
     extracted_fields: dict[str, str | None] = {}
+    candidates: dict[str, list[str]] = {}
 
     if (file.content_type or "").lower() == "application/pdf":
         try:
             extracted_text = extract_pdf_text(destination)
             extraction_status = "text_extraction_completed"
             extraction_note = "PDF text extracted successfully." if extracted_text else "PDF contains no selectable text; OCR may be needed."
-            extracted_fields = extract_certificate_fields(extracted_text) if extracted_text else {}
+            if extracted_text:
+                extracted_fields = extract_certificate_fields(extracted_text)
+                candidates = extract_candidates(extracted_text)
         except Exception as exc:
             extraction_status = "text_extraction_failed"
             extraction_note = f"Could not extract PDF text: {type(exc).__name__}"
@@ -123,6 +150,8 @@ async def upload_certificate(file: UploadFile = File(...)) -> dict:
         "next_step": extraction_status,
         "extraction_note": extraction_note,
         "text_preview": extracted_text[:2000],
+        "full_text": extracted_text,
         "extracted_fields": extracted_fields,
+        "candidate_values": candidates,
         "missing_fields": missing_fields,
     }
