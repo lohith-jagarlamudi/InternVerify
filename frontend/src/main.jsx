@@ -57,11 +57,14 @@ function App() {
         {details && (
           <div className="result" aria-live="polite">
             <h3>Certificate processing</h3>
-            <p><strong>Status:</strong> {details.status}</p>
+            <p><strong>Status:</strong> <span className={`status ${details.status}`}>{details.status.replaceAll('_', ' ')}</span></p>
             <p><strong>Certificate ID:</strong> {details.certificate_id}</p>
             <p><strong>File size:</strong> {details.size_bytes} bytes</p>
             <p><strong>Extraction status:</strong> {details.next_step}</p>
             <p><strong>Note:</strong> {details.extraction_note}</p>
+            {details.missing_fields?.length > 0 && (
+              <p className="review-warning"><strong>Needs review:</strong> Missing {details.missing_fields.map((key) => fieldLabels[key] || key).join(', ')}.</p>
+            )}
             {details.extracted_fields && (
               <>
                 <h3>Extracted certificate fields</h3>
