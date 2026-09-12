@@ -5,6 +5,7 @@ import './styles.css';
 function App() {
   const [file, setFile] = useState(null);
   const [message, setMessage] = useState('');
+  const [details, setDetails] = useState(null);
 
   async function submit(event) {
     event.preventDefault();
@@ -13,6 +14,7 @@ function App() {
     const body = new FormData();
     body.append('file', file);
     setMessage('Uploading…');
+    setDetails(null);
 
     try {
       const response = await fetch('http://localhost:8000/api/certificates/upload', {
@@ -20,9 +22,11 @@ function App() {
         body,
       });
       const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Upload failed');
       setMessage(`Received: ${result.filename}`);
-    } catch {
-      setMessage('Upload failed. Is the API running on port 8000?');
+      setDetails(result);
+    } catch (error) {
+      setMessage(error.message || 'Upload failed. Is the API running on port 8000?');
     }
   }
 
@@ -40,6 +44,15 @@ function App() {
           <button type="submit" disabled={!file}>Upload certificate</button>
         </form>
         {message && <p className="message" role="status">{message}</p>}
+        {details && (
+          <div className="result" aria-live="polite">
+            <h3>Upload details</h3>
+            <p><strong>Status:</strong> {details.status}</p>
+            <p><strong>Certificate ID:</strong> {details.certificate_id}</p>
+            <p><strong>File size:</strong> {details.size_bytes} bytes</p>
+            <p><strong>Next step:</strong> {details.next_step}</p>
+          </div>
+        )}
       </section>
     </main>
   );
