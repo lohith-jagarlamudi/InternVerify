@@ -75,11 +75,23 @@ function App() {
                 </div>
               </>
             )}
-            {details.text_preview && (
+            {details.candidate_values && (
               <>
-                <h3>Extracted text preview</h3>
-                <pre className="text-preview">{details.text_preview}</pre>
+                <h3>Candidate values for manual review</h3>
+                <p className="muted">These are possible matches from unlabeled certificate text. Confirm them before verification.</p>
+                {Object.entries(details.candidate_values).map(([key, values]) => (
+                  <div className="candidate-group" key={key}>
+                    <strong>{key.replaceAll('_', ' ')}</strong>
+                    {values.length ? <ul>{values.map((value, index) => <li key={`${key}-${index}`}>{value}</li>)}</ul> : <p>None detected</p>}
+                  </div>
+                ))}
               </>
+            )}
+            {details.full_text && (
+              <details className="raw-text">
+                <summary>Show complete extracted text</summary>
+                <pre className="text-preview">{details.full_text}</pre>
+              </details>
             )}
           </div>
         )}
