@@ -206,33 +206,103 @@ def extract_urls(text: str) -> list[str]:
 
 
 def scan_image(image, detector, page_number: int | None = None) -> list[dict]:
+    """Robust QR detection for scanned/printed certificates.
+
+    QR codes are often small, slightly rotated, low-contrast, or embedded in a
+    large certificate. OpenCV's one-pass detector can miss those cases, so we
+    progressively upscale, enhance contrast, rotate, and crop likely QR regions.
+    """
     found = []
     seen = set()
 
     def add_value(value: str):
-        value = (value or "").strip()
+        value = clean_url((value or "").strip())
         if not value or value in seen:
             return
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return
         seen.add(value)
-        if value.startswith(("http://", "https://")):
-            found.append({"source_type": "qr", "url": clean_url(value), "page": page_number})
+        found.append({"source_type": "qr", "url": value, "page": page_number})
 
-    images = [image]
-    try:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        images.extend([
-            gray,
-            cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-        ])
-    except Exception:
-        pass
+    if image is None or image.size == 0:
+        return found
 
-    for candidate in images:
+    candidates = []
+
+    # Work on a reasonably large image. This is particularly important when a
+    # QR occupies only a small area of a high-resolution certificate.
+    height, width = image.shape[:2]
+    scale = 1.0
+    if max(height, width) < 2400:
+        scale = min(4.0, 2400.0 / max(height, width))
+    elif min(height, width) < 900:
+        scale = 2.0
+    working = cv2.resize(
+        image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+    ) if scale != 1.0 else image
+
+    gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+    enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+
+    variants = [
+        working,
+        gray,
+        enhanced,
+        cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+        cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 7
+        ),
+    ]
+
+    # Try a modest sharpening pass for photographed/scanned certificates.
+    blur = cv2.GaussianBlur(gray, (0, 0), 2)
+    variants.append(cv2.addWeighted(gray, 1.7, blur, -0.7, 0))
+
+    for variant in variants:
+        candidates.append(variant)
+        # QR detectors are sensitive to rotation; include the common 90-degree
+        # orientations without making arbitrary perspective assumptions.
+        candidates.append(cv2.rotate(variant, cv2.ROTATE_90_CLOCKWISE))
+        candidates.append(cv2.rotate(variant, cv2.ROTATE_90_COUNTERCLOCKWISE))
+        candidates.append(cv2.rotate(variant, cv2.ROTATE_180))
+
+    # If the certificate is large, scan overlapping tiles as well. This catches
+    # QR codes that are too small relative to the full page for the detector.
+    h, w = gray.shape[:2]
+    if min(h, w) >= 1200:
+        tile_h, tile_w = max(900, h // 2), max(900, w // 2)
+        step_y = max(450, tile_h // 2)
+        step_x = max(450, tile_w // 2)
+        for y in range(0, max(1, h - tile_h + 1), step_y):
+            for x in range(0, max(1, w - tile_w + 1), step_x):
+                tile = gray[y:min(y + tile_h, h), x:min(x + tile_w, w)]
+                if tile.size:
+                    candidates.append(tile)
+                    candidates.append(cv2.threshold(
+                        tile, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                    )[1])
+
+    # Preserve order but avoid running the detector on identical-sized duplicate
+    # arrays unnecessarily.
+    unique_candidates = []
+    signatures = set()
+    for candidate in candidates:
+        if candidate is None or candidate.size == 0:
+            continue
+        signature = (candidate.shape, int(candidate.mean()), int(candidate.std()))
+        if signature in signatures:
+            continue
+        signatures.add(signature)
+        unique_candidates.append(candidate)
+
+    for candidate in unique_candidates:
         try:
             multi = detector.detectAndDecodeMulti(candidate)
             if multi and len(multi) == 4:
                 ok, values, _, _ = multi
-                if ok and values:
+                if values is not None:
                     for value in values:
                         add_value(value)
         except Exception:
@@ -242,9 +312,12 @@ def scan_image(image, detector, page_number: int | None = None) -> list[dict]:
             add_value(value)
         except Exception:
             pass
+        if found:
+            # Once a valid HTTP(S) QR payload is decoded there is no need to keep
+            # scanning the remaining variants.
+            break
 
     return found
-
 
 def detect_verification_sources(path: Path, content_type: str, text: str) -> list[dict]:
     detector = cv2.QRCodeDetector()
