@@ -208,9 +208,11 @@ def extract_urls(text: str) -> list[str]:
 def scan_image(image, detector, page_number: int | None = None) -> list[dict]:
     """Robust QR detection for scanned/printed certificates.
 
-    QR codes are often small, slightly rotated, low-contrast, or embedded in a
-    large certificate. OpenCV's one-pass detector can miss those cases, so we
-    progressively upscale, enhance contrast, rotate, and crop likely QR regions.
+    QR codes can be small, low-contrast, JPEG-compressed, slightly rotated, or
+    embedded in a large certificate. The detector may find the QR corners but
+    still fail to decode the payload at the certificate's native resolution.
+    We therefore try enhanced full-image variants and, when corners are found,
+    rectify the detected QR region and decode that region at high resolution.
     """
     found = []
     seen = set()
@@ -230,8 +232,51 @@ def scan_image(image, detector, page_number: int | None = None) -> list[dict]:
 
     candidates = []
 
+    # Fast path for the common case where OpenCV can locate the QR corners but
+    # cannot decode the payload from the full certificate. Crop the detected
+    # quadrilateral tightly and upscale it before decoding. This is especially
+    # important for compressed WhatsApp/JPEG certificate images.
+    try:
+        ok, points = detector.detect(image)
+        if ok and points is not None:
+            pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+            if len(pts) >= 4:
+                pts = pts[:4]
+                x0, y0 = np.floor(pts.min(axis=0)).astype(int)
+                x1, y1 = np.ceil(pts.max(axis=0)).astype(int)
+                pad = max(2, int(max(x1 - x0, y1 - y0) * 0.02))
+                x0 = max(0, x0 - pad)
+                y0 = max(0, y0 - pad)
+                x1 = min(image.shape[1], x1 + pad + 1)
+                y1 = min(image.shape[0], y1 + pad + 1)
+                qr_crop = image[y0:y1, x0:x1]
+                for scale in (6, 8, 10):
+                    enlarged = cv2.resize(
+                        qr_crop, None, fx=scale, fy=scale,
+                        interpolation=cv2.INTER_LINEAR
+                    )
+                    qr_gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+                    qr_variants = [
+                        enlarged,
+                        qr_gray,
+                        cv2.threshold(
+                            qr_gray, 0, 255,
+                            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                        )[1],
+                    ]
+                    for qr_variant in qr_variants:
+                        try:
+                            value, _, _ = detector.detectAndDecode(qr_variant)
+                            add_value(value)
+                        except Exception:
+                            pass
+                        if found:
+                            return found
+    except Exception:
+        pass
+
     # Work on a reasonably large image. This is particularly important when a
-    # QR occupies only a small area of a high-resolution certificate.
+    # QR occupies only a small area of a certificate.
     height, width = image.shape[:2]
     scale = 1.0
     if max(height, width) < 2400:
@@ -297,7 +342,86 @@ def scan_image(image, detector, page_number: int | None = None) -> list[dict]:
         signatures.add(signature)
         unique_candidates.append(candidate)
 
+    # First run normal decoding. If OpenCV can locate the QR but cannot decode
+    # it at the full-certificate scale, immediately rectify the detected
+    # quadrilateral and try a high-resolution crop with a quiet zone.
     for candidate in unique_candidates:
+        try:
+            ok, points = detector.detect(candidate)
+            if ok and points is not None:
+                pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+                if len(pts) >= 4:
+                    pts = pts[:4]
+                    # Order the four corners as top-left, top-right,
+                    # bottom-right, bottom-left.
+                    s = pts.sum(axis=1)
+                    d = np.diff(pts, axis=1).reshape(-1)
+                    ordered = np.array([
+                        pts[np.argmin(s)],
+                        pts[np.argmin(d)],
+                        pts[np.argmax(s)],
+                        pts[np.argmax(d)],
+                    ], dtype=np.float32)
+
+                    width_a = np.linalg.norm(ordered[2] - ordered[3])
+                    width_b = np.linalg.norm(ordered[1] - ordered[0])
+                    height_a = np.linalg.norm(ordered[1] - ordered[2])
+                    height_b = np.linalg.norm(ordered[0] - ordered[3])
+                    side = max(int(max(width_a, width_b)), int(max(height_a, height_b)), 100)
+                    side = min(max(side * 4, 400), 2400)
+
+                    target = np.array([
+                        [0, 0],
+                        [side - 1, 0],
+                        [side - 1, side - 1],
+                        [0, side - 1],
+                    ], dtype=np.float32)
+                    matrix = cv2.getPerspectiveTransform(ordered, target)
+                    rectified = cv2.warpPerspective(
+                        candidate, matrix, (side, side),
+                        flags=cv2.INTER_CUBIC,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=255,
+                    )
+
+                    # A QR needs a quiet white border. Add one explicitly and
+                    # try several resampling/threshold variants. This handles
+                    # compressed certificate images where direct decoding fails.
+                    for interpolation in (cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_LANCZOS4):
+                        scaled = cv2.resize(
+                            rectified, None, fx=2.0, fy=2.0,
+                            interpolation=interpolation,
+                        )
+                        border = max(20, int(side * 0.08))
+                        bordered = cv2.copyMakeBorder(
+                            scaled, border, border, border, border,
+                            cv2.BORDER_CONSTANT, value=255,
+                        )
+                        gray_qr = cv2.cvtColor(bordered, cv2.COLOR_BGR2GRAY) if len(bordered.shape) == 3 else bordered
+                        qr_variants = [
+                            bordered,
+                            gray_qr,
+                            cv2.threshold(
+                                gray_qr, 0, 255,
+                                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+                            )[1],
+                            cv2.adaptiveThreshold(
+                                gray_qr, 255,
+                                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 51, 5,
+                            ),
+                        ]
+                        for qr_variant in qr_variants:
+                            try:
+                                value, _, _ = detector.detectAndDecode(qr_variant)
+                                add_value(value)
+                            except Exception:
+                                pass
+                            if found:
+                                return found
+        except Exception:
+            pass
+
         try:
             multi = detector.detectAndDecodeMulti(candidate)
             if multi and len(multi) == 4:
@@ -313,9 +437,7 @@ def scan_image(image, detector, page_number: int | None = None) -> list[dict]:
         except Exception:
             pass
         if found:
-            # Once a valid HTTP(S) QR payload is decoded there is no need to keep
-            # scanning the remaining variants.
-            break
+            return found
 
     return found
 
@@ -474,7 +596,54 @@ def extract_certificate_fields(text: str, sources: list[dict] | None = None) -> 
             if student_name:
                 break
 
-    # 3) Explicit labelled-name patterns as a fallback.
+    # 3) Standalone recipient line used by many designed internship certificates.
+    # Example: "CERTIFICATE OF INTERNSHIP" followed by the recipient name and
+    # then the sentence beginning "For successfully completing...". This is
+    # deliberately bounded so arbitrary all-caps text elsewhere on a certificate
+    # is not mistaken for the recipient.
+    if not student_name:
+        standalone_patterns = [
+            r"certificate\s+of\s+internship\s*\n+\s*([A-Z][A-Z .,'-]{1,100})\s*\n+\s*For\s+successfully\s+completing",
+            r"certificate\s*\n+\s*of\s+internship\s*\n+\s*([A-Z][A-Z .,'-]{1,100})\s*\n+\s*For\s+successfully\s+completing",
+            r"certificate\s+of\s+internship[^\n]*\n+\s*([A-Z][A-Z .,'-]{1,100})\s*\n+",
+        ]
+        for pattern in standalone_patterns:
+            found = re.search(pattern, normalized, flags=re.IGNORECASE | re.MULTILINE)
+            if found:
+                candidate = found.group(1).strip()
+                # Require the captured line to look like a person name rather
+                # than a heading such as "YOUR SKILL SUCCESS JOURNEY".
+                if len(candidate.split()) <= 8 and not re.search(
+                    r"\b(?:certificate|internship|unified|mentor|skill|success|journey|verify)\b",
+                    candidate, flags=re.I
+                ):
+                    student_name = recipient_candidate(candidate)
+                    if student_name:
+                        break
+
+        # OCR commonly separates the heading as two lines: "CERTIFICATE" /
+        # "OF INTERNSHIP". In that layout, inspect only the next few lines and
+        # require the following line to start the certificate description.
+        if not student_name:
+            lines_for_name = [clean(line) for line in normalized.split("\n")]
+            lines_for_name = [line for line in lines_for_name if line]
+            for index, line in enumerate(lines_for_name):
+                if not re.fullmatch(r"of\s+internship", line or "", flags=re.I):
+                    continue
+                if index == 0 or not re.search(r"certificate", lines_for_name[index - 1], flags=re.I):
+                    continue
+                for candidate_line in lines_for_name[index + 1:index + 4]:
+                    if not re.fullmatch(r"[A-Z][A-Z .,'-]{1,100}", candidate_line or ""):
+                        continue
+                    if re.search(r"\b(?:certificate|internship|unified|mentor|skill|success|journey|verify)\b", candidate_line, flags=re.I):
+                        continue
+                    student_name = recipient_candidate(candidate_line)
+                    if student_name:
+                        break
+                if student_name:
+                    break
+
+    # 4) Explicit labelled-name patterns as a fallback.
     if not student_name:
         student_name = recipient_candidate(match([
             r"(?:student|intern|trainee|candidate)\s*(?:full\s*)?name\s*[:\-]\s*([A-Za-z][A-Za-z .,'-]{0,100})",
@@ -771,8 +940,8 @@ def _normalise(value, field: str | None = None) -> str:
 
 
 def compare_certificate_fields(uploaded: dict, browser: dict) -> dict:
-    # Issue date is intentionally excluded from verification.
-    # It is displayed/stored for reference only, never used to reject a certificate.
+    # Issue date is included in verification because an edited issue date must
+    # be detected as a real field mismatch against the verification record.
     labels = {
         "student_name": "Student name",
         "certificate_number": "Certificate number",
@@ -781,6 +950,9 @@ def compare_certificate_fields(uploaded: dict, browser: dict) -> dict:
         "start_date": "Start date",
         "end_date": "End date",
         "duration": "Duration",
+        # The issued date is a mapped verification field. If it differs from
+        # the verification record, the certificate must be Not Verified.
+        "issue_date": "Issue date",
     }
     comparisons = []
     for key, label in labels.items():
@@ -826,7 +998,6 @@ def classify_match(uploaded: dict, browser: dict, browser_status: str) -> tuple[
     if report["compared"] > 0 and report["matched"] == report["compared"]:
         return "verified", "All available mapped fields matched exactly."
     return "ignore", "No comparable mapped data was found."
-
 
 @app.post("/api/certificates/{certificate_id}/verify")
 async def verify_certificate(certificate_id: str):
@@ -928,9 +1099,20 @@ def history_duplicates(certificate_id: str):
 def review_history(certificate_id: str, payload: dict):
     notes = str(payload.get("review_notes") or "").strip()
     reviewed = 1 if payload.get("reviewed", True) else 0
+    if reviewed and not notes:
+        raise HTTPException(status_code=400, detail="Review remarks are mandatory before marking a certificate as reviewed.")
     with sqlite3.connect(DB_PATH) as db:
-        cursor = db.execute("UPDATE verification_history SET review_notes = ?, reviewed = ?, status = CASE WHEN ? = 1 AND status = 'almost' THEN 'verified' ELSE status END, reason = CASE WHEN ? = 1 AND status = 'almost' THEN 'Faculty approved after exact field match.' ELSE reason END WHERE certificate_id = ?", (notes, reviewed, reviewed, reviewed, certificate_id))
+        if reviewed:
+            cursor = db.execute(
+                "UPDATE verification_history SET review_notes = ?, reviewed = 1, status = 'verified', reason = ? WHERE certificate_id = ?",
+                (notes, f"Faculty manually reviewed and approved: {notes}", certificate_id),
+            )
+        else:
+            cursor = db.execute(
+                "UPDATE verification_history SET review_notes = ?, reviewed = 0 WHERE certificate_id = ?",
+                (notes, certificate_id),
+            )
         db.commit()
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="History record not found")
-    return {"ok": True, "certificate_id": certificate_id, "review_notes": notes, "reviewed": bool(reviewed)}
+    return {"ok": True, "certificate_id": certificate_id, "review_notes": notes, "reviewed": bool(reviewed), "status": "verified" if reviewed else None}
